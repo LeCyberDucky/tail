@@ -3,9 +3,13 @@
 // 2. Option for monitoring multiple files simultaneously
 // 3. Option to read from top instead of bottom
 // 4. Option to clear output
+// 5. Other stuff from UNIX tail: https://en.wikipedia.org/wiki/Tail_(Unix)
+// 6. Take refresh rate as optional argument
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use anyhow::{Context, Result};
@@ -30,19 +34,51 @@ fn main() -> Result<()> {
         .author("Andy")
         .about("Monitors a file, continuously printing new lines written to it")
         .arg(
+            Arg::with_name("n")
+                .short("-n")
+                .case_insensitive(true)
+                .takes_value(true)
+                .default_value("10")
+                .validator(|value| {
+                    let value = value.parse::<usize>();
+                    match value {
+                        Ok(_) => Ok(()),
+                        Err(_) => Err("n should be a positive integer.".to_string()),
+                    }
+                })
+                .value_name("NUMBER")
+                .conflicts_with("follow")
+                .required(false)
+                .help("The number of lines to display."),
+        )
+        .arg(
+            Arg::with_name("follow")
+                .short("-f")
+                .case_insensitive(true)
+                .long("-follow")
+                .case_insensitive(true)
+                .takes_value(false)
+                .required(false)
+                .help("Continuously monitor the file for new lines."),
+        )
+        .arg(
             Arg::with_name("file")
-                .short("f")
+                .takes_value(true)
                 .value_name("FILE")
                 .help("The file to monitor")
-                .required(true)
-                .index(1)
-                .takes_value(true),
+                .required(true),
         )
         .get_matches();
+
+    println!("{:?}", matches);
 
     // Parse input argument as file path
     let file = matches.value_of("file").unwrap(); // The unwrap here is safe, because the argument is required
     let file = validate_path(file);
+
+    let mut clock = Instant::now();
+    let mut refresh_count = 0;
+    let refresh_rate = 10;
 
     let file_path;
 
@@ -60,7 +96,7 @@ fn main() -> Result<()> {
                         .open(file_path.clone())
                         .is_ok()
                     {
-                        // sleep_remaining_frame();
+                        sleep_remaining_frame(clock, &mut refresh_count, refresh_rate);
                         todo!();
                     }
                 }
@@ -69,11 +105,30 @@ fn main() -> Result<()> {
         },
     }
 
-    loop {
-        // Check for file change
-        // Print change
-        // Sleep
+    if matches.occurrences_of("n") > 0 {
+        // Only read once. Do not monitor continuously
+    } else {
+        // Monitor continuously
+        clock = Instant::now();
+        loop {
+            if (clock.elapsed().as_secs() % 5) == 0 {
+                println!(
+                    "Elapsed seconds: {}\t Frame count: {}",
+                    clock.elapsed().as_secs(),
+                    refresh_count
+                );
+            }
+            sleep_remaining_frame(clock, &mut refresh_count, refresh_rate);
+        }
     }
+
+    // If -f specified, continuously monitor file
+
+    // loop {
+    //     // Check for file change
+    //     // Print change
+    //     // Sleep
+    // }
 
     // Keep reading/printing
 
@@ -121,5 +176,21 @@ fn validate_path(path_string: &str) -> std::result::Result<PathBuf, FileError> {
             path: path.into(),
             source: error,
         }),
+    }
+}
+
+fn sleep_remaining_frame(clock: Instant, count: &mut u128, rate: u128) {
+    *count += 1;
+
+    let micros_per_second = 1_000_000;
+    let expected_frame_count = clock.elapsed().as_micros() * rate;
+    let frame_count = *count * micros_per_second;
+
+    // If this is positive, we should sleep the difference away
+    let count_delta = (frame_count as i128) - (expected_frame_count as i128);
+
+    if count_delta > 0 {
+        let sleep_time = (count_delta as u128) / rate;
+        thread::sleep(Duration::from_micros(sleep_time as u64));
     }
 }
