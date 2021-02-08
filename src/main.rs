@@ -6,7 +6,8 @@
 // 5. Other stuff from UNIX tail: https://en.wikipedia.org/wiki/Tail_(Unix)
 // 6. Take refresh rate as optional argument
 
-use std::fs::OpenOptions;
+use std::{fs::OpenOptions, io::BufRead};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -67,6 +68,31 @@ fn main() -> Result<()> {
                 .value_name("FILE")
                 .help("The file to monitor")
                 .required(true),
+        ).arg(
+            Arg::with_name("rate")
+                .case_insensitive(true)
+                .takes_value(true)
+                .default_value("4")
+                .validator(|value| {
+                    let value = value.parse::<f64>();
+                    if let Ok(number) = value {
+                        if number > 0.0 {
+                            return Ok(());
+                        }
+                    }
+                    
+                    Err("rate should be a positive number.".to_string())
+                })
+                .value_name("NUMBER")
+                .required(false)
+                .help("Refresh rate in Hz -> How often to check for file updates.")
+
+        )
+        .arg(
+            Arg::with_name("head")
+                .case_insensitive(true)
+                .takes_value(false)
+                .help("Read from top to bottom")
         )
         .get_matches();
 
@@ -135,6 +161,48 @@ fn main() -> Result<()> {
     // No need to check for command line input, since ctrl+Z will just naturally terminate the program
 
     Ok(())
+}
+
+enum ReadingOrder {
+    TopToBottom,
+    BottomToTop,
+}
+
+enum Position {
+    Begin,
+    Inbetween(usize),
+    End,
+}
+
+fn read_lines(file_path: PathBuf, order: ReadingOrder, start_position: Position, n: usize) -> Result<Vec<String>> {
+    let file = OpenOptions::new()
+                        .read(true)
+                        .open(file_path)?;
+
+    let file_buffer = BufReader::new(file);
+    let lines: Result<Vec<String>, _> = file_buffer.lines().collect();
+    let lines = lines?;
+    let line_count = lines.len();
+
+    let (start_position, id) = match start_position {
+        Position::Begin => (Position::Inbetween(0), 0),
+        Position::End => (Position::Inbetween(line_count), line_count),
+        Position::Inbetween(pos) => (Position::Inbetween(pos), pos),
+    };
+
+    let stop_position = match order {
+        ReadingOrder::TopToBottom => Position::Inbetween(
+                (id + n).min(line_count)
+            ),
+        ReadingOrder::BottomToTop => Position::Inbetween(
+                id.saturating_sub(n)
+        ),
+    };
+
+    todo!();
+
+
+    Ok(vec![])
 }
 
 fn validate_path(path_string: &str) -> std::result::Result<PathBuf, FileError> {
