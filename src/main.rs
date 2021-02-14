@@ -6,11 +6,12 @@
 // 5. Other stuff from UNIX tail: https://en.wikipedia.org/wiki/Tail_(Unix)
 // 6. Take refresh rate as optional argument
 
-use std::{fs::OpenOptions, io::BufRead};
+use std::collections::VecDeque;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::{fs::OpenOptions, io::BufRead};
 
 use anyhow::anyhow;
 use anyhow::{Context, Result};
@@ -23,6 +24,12 @@ enum FileError {
     #[error("Unable to access file: \"{path}\"")]
     AccessError {
         path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("Unable to read line: {error_line}")]
+    ReadError {
+        valid_reads: Vec<String>,
+        error_line: usize,
         source: std::io::Error,
     },
     #[error(transparent)]
@@ -68,7 +75,8 @@ fn main() -> Result<()> {
                 .value_name("FILE")
                 .help("The file to monitor")
                 .required(true),
-        ).arg(
+        )
+        .arg(
             Arg::with_name("rate")
                 .case_insensitive(true)
                 .takes_value(true)
@@ -80,19 +88,18 @@ fn main() -> Result<()> {
                             return Ok(());
                         }
                     }
-                    
+
                     Err("rate should be a positive number.".to_string())
                 })
                 .value_name("NUMBER")
                 .required(false)
-                .help("Refresh rate in Hz -> How often to check for file updates.")
-
+                .help("Refresh rate in Hz -> How often to check for file updates."),
         )
         .arg(
             Arg::with_name("head")
                 .case_insensitive(true)
                 .takes_value(false)
-                .help("Read from top to bottom")
+                .help("Read from top to bottom"),
         )
         .get_matches();
 
@@ -127,6 +134,7 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            FileError::ReadError{valid_reads: _, error_line: _, source: _} => return Err(anyhow::anyhow!(error)), // Don't think this case should happen, as we are not trying to read here
             FileError::OtherError(error) => return Err(error),
         },
     }
@@ -137,13 +145,6 @@ fn main() -> Result<()> {
         // Monitor continuously
         clock = Instant::now();
         loop {
-            if (clock.elapsed().as_secs() % 5) == 0 {
-                println!(
-                    "Elapsed seconds: {}\t Frame count: {}",
-                    clock.elapsed().as_secs(),
-                    refresh_count
-                );
-            }
             sleep_remaining_frame(clock, &mut refresh_count, refresh_rate);
         }
     }
@@ -163,46 +164,118 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-enum ReadingOrder {
+enum ReadingDirection {
     TopToBottom,
     BottomToTop,
 }
 
+#[derive(PartialEq)]
 enum Position {
     Begin,
     Inbetween(usize),
     End,
 }
 
-fn read_lines(file_path: PathBuf, order: ReadingOrder, start_position: Position, n: usize) -> Result<Vec<String>> {
-    let file = OpenOptions::new()
-                        .read(true)
-                        .open(file_path)?;
+fn read_lines(
+    file_path: PathBuf,
+    direction: ReadingDirection,
+    start_position: Position,
+    n: usize,
+) -> std::result::Result<Vec<String>, FileError> {
+    let (start, stop) = match direction {
+        ReadingDirection::TopToBottom => match start_position {
+            Position::Begin => (Position::Begin, Position::Inbetween(n)),
+            Position::Inbetween(pos) => (Position::Inbetween(pos), Position::Inbetween(pos + n)),
+            Position::End => (Position::End, Position::End),
+        },
 
-    let file_buffer = BufReader::new(file);
-    let lines: Result<Vec<String>, _> = file_buffer.lines().collect();
-    let lines = lines?;
-    let line_count = lines.len();
-
-    let (start_position, id) = match start_position {
-        Position::Begin => (Position::Inbetween(0), 0),
-        Position::End => (Position::Inbetween(line_count), line_count),
-        Position::Inbetween(pos) => (Position::Inbetween(pos), pos),
-    };
-
-    let stop_position = match order {
-        ReadingOrder::TopToBottom => Position::Inbetween(
-                (id + n).min(line_count)
+        ReadingDirection::BottomToTop => match start_position {
+            Position::Begin => (Position::Begin, Position::Begin),
+            Position::Inbetween(pos) => (
+                Position::Inbetween(pos.saturating_sub(n)),
+                Position::Inbetween(pos),
             ),
-        ReadingOrder::BottomToTop => Position::Inbetween(
-                id.saturating_sub(n)
-        ),
+            Position::End => (Position::Begin, Position::End),
+        },
     };
 
-    todo!();
+    if start == Position::End || stop == Position::Begin {
+        return Ok(vec![]);
+    }
 
+    let mut line_count = 0;
+    let mut lines_in_range = 0;
+    let mut lines = VecDeque::new();
+    let mut line_buffer = String::new();
+    let file = OpenOptions::new()
+        .read(true)
+        .open(file_path.clone())
+        .map_err(|error| {
+            FileError::AccessError {
+                path: file_path,
+                source: error,
+            }
+        })?;
+    let mut reader = BufReader::new(file);
 
-    Ok(vec![])
+    // Keep on reading
+    loop {
+        // Check for stop condition
+        if let Position::Inbetween(pos) = &stop {
+            if line_count >= *pos {
+                break;
+            }
+        }
+
+        line_buffer.clear();
+        let bytes_read = reader.read_line(&mut line_buffer);
+        line_count += 1;
+
+        match bytes_read {
+            Ok(count) => {
+                if count == 0 {
+                    break;
+                }
+            } // Break if end of file reached
+            Err(error) => {
+                return Err(FileError::ReadError {
+                    valid_reads: match direction {
+                        ReadingDirection::TopToBottom => lines.into(),
+                        ReadingDirection::BottomToTop => lines.into_iter().rev().collect(),
+                    },
+                    error_line: line_count,
+                    source: error,
+                })
+            }
+        }
+
+        // Only store line if wanted starting position has been passed
+        if let Position::Inbetween(pos) = start {
+            if line_count < pos {
+                continue;
+            }
+        }
+
+        lines.push_back(line_buffer.clone());
+        if lines.len() > n {
+            lines.pop_front();
+        }
+    }
+
+    match direction {
+        ReadingDirection::TopToBottom => Ok(lines.into_iter().collect()),
+        ReadingDirection::BottomToTop => Ok(lines.into_iter().rev().collect()),
+    }
+
+    // https://crates.io/crates/easy_reader
+    // https://www.reddit.com/r/rust/comments/99e4tq/reading_files_quickly_in_rust/
+    // https://github.com/Freaky/rust-linereader
+    // https://www.reddit.com/r/rust/comments/99lm5l/easyreader_an_easy_and_fast_way_to_read_huge/
+    // https://codereview.stackexchange.com/questions/227204/fast-text-search-in-rust
+    // https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_line
+    // https://www.reddit.com/r/rust/comments/8833lh/performance_of_parsing_large_file_2gb/
+    // https://depth-first.com/articles/2020/07/20/reading-sd-files-in-rust/
+    // https://stackoverflow.com/questions/31986628/collect-items-from-an-iterator-at-a-specific-index
 }
 
 fn validate_path(path_string: &str) -> std::result::Result<PathBuf, FileError> {
