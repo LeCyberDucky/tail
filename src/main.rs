@@ -43,7 +43,7 @@ fn main() -> Result<()> {
         .about("Monitors a file, continuously printing new lines written to it")
         .arg(
             Arg::with_name("n")
-                .short("-n")
+                .short("n")
                 .case_insensitive(true)
                 .takes_value(true)
                 .default_value("10")
@@ -61,9 +61,9 @@ fn main() -> Result<()> {
         )
         .arg(
             Arg::with_name("follow")
-                .short("-f")
+                .short("f")
                 .case_insensitive(true)
-                .long("-follow")
+                .long("follow")
                 .case_insensitive(true)
                 .takes_value(false)
                 .required(false)
@@ -73,11 +73,12 @@ fn main() -> Result<()> {
             Arg::with_name("file")
                 .takes_value(true)
                 .value_name("FILE")
-                .help("The file to monitor")
-                .required(true),
+                .required(true)
+                .help("The file to monitor"),
         )
         .arg(
             Arg::with_name("rate")
+                .long("rate")
                 .case_insensitive(true)
                 .takes_value(true)
                 .default_value("4")
@@ -99,48 +100,79 @@ fn main() -> Result<()> {
             Arg::with_name("head")
                 .case_insensitive(true)
                 .takes_value(false)
-                .help("Read from top to bottom"),
+                .help("Read from the beginning of the file"),
+        )
+        .arg(
+            Arg::with_name("reverse")
+                .short("r")
+                .case_insensitive(true)
+                .long("-reverse")
+                .case_insensitive(true)
+                .takes_value(false)
+                .required(false)
+                .help("Read in reverse direction"),
         )
         .get_matches();
 
-    println!("{:?}", matches);
+    let mut clock = Instant::now();
+
+    let reading_direction = if matches.is_present("reverse") {
+        ReadingDirection::BottomToTop
+    } else {
+        ReadingDirection::TopToBottom
+    };
+
+    let start_position = if matches.is_present("head") {
+        Position::End
+    } else {
+        Position::Begin
+    };
+
+    let n = matches.value_of("n").unwrap().parse::<usize>().unwrap(); // Unwraps are safe because argument has validator and default value
+
+    let mut refresh_count = 0;
+    let refresh_rate = matches.value_of("rate").unwrap().parse::<f64>().unwrap(); // Unwraps here are okay, I guess, because this has a default value and has a validator
 
     // Parse input argument as file path
-    let file = matches.value_of("file").unwrap(); // The unwrap here is safe, because the argument is required
-    let file = validate_path(file);
+    let mut file_path = matches.value_of("file").unwrap(); // The unwrap here is safe, because the argument is required
+    let mut file_patch = validate_path(file_path);
 
-    let mut clock = Instant::now();
-    let mut refresh_count = 0;
-    let refresh_rate = 10;
+    // Try to handle possible errors
+    file_patch = match file_patch {
+        Ok(path) => Ok(path),
+        Err(error) => {
+            match error {
+                FileError::AccessError {
+                    ref path,
+                    source: _,
+                } => {
+                    eprintln!("{}\n{:#?}", error, error);
+                    println!("Waiting for file to become accessible.");
 
-    let file_path;
-
-    match file {
-        Ok(path) => file_path = path,
-        Err(error) => match error {
-            FileError::AccessError { path: _, source: _ } => {
-                eprintln!("{}\n{:#?}", error, error);
-                println!("Waiting for file to become accessible.");
-
-                if let FileError::AccessError { path, source: _ } = error {
-                    file_path = path;
-                    while !OpenOptions::new()
-                        .read(true)
-                        .open(file_path.clone())
-                        .is_ok()
-                    {
+                    while !OpenOptions::new().read(true).open(path.clone()).is_ok() {
                         sleep_remaining_frame(clock, &mut refresh_count, refresh_rate);
                         todo!();
                     }
+
+                    Ok(path.clone())
                 }
+                FileError::ReadError {
+                    valid_reads: _,
+                    error_line: _,
+                    source: _,
+                } => Err(error), // Don't think this case should happen, as we are not trying to read here
+                FileError::OtherError(_) => Err(error),
             }
-            FileError::ReadError{valid_reads: _, error_line: _, source: _} => return Err(anyhow::anyhow!(error)), // Don't think this case should happen, as we are not trying to read here
-            FileError::OtherError(error) => return Err(error),
-        },
-    }
+        }
+    };
+
+    // If error can't be handled, return
+    let file_path = file_patch?;
 
     if matches.occurrences_of("n") > 0 {
         // Only read once. Do not monitor continuously
+        let lines = read_lines(file_path, reading_direction, start_position, n);
+        
     } else {
         // Monitor continuously
         clock = Instant::now();
@@ -210,11 +242,9 @@ fn read_lines(
     let file = OpenOptions::new()
         .read(true)
         .open(file_path.clone())
-        .map_err(|error| {
-            FileError::AccessError {
-                path: file_path,
-                source: error,
-            }
+        .map_err(|error| FileError::AccessError {
+            path: file_path,
+            source: error,
         })?;
     let mut reader = BufReader::new(file);
 
@@ -320,18 +350,18 @@ fn validate_path(path_string: &str) -> std::result::Result<PathBuf, FileError> {
     }
 }
 
-fn sleep_remaining_frame(clock: Instant, count: &mut u128, rate: u128) {
+fn sleep_remaining_frame(clock: Instant, count: &mut u128, rate: f64) {
     *count += 1;
 
     let micros_per_second = 1_000_000;
-    let expected_frame_count = clock.elapsed().as_micros() * rate;
+    let expected_frame_count = (clock.elapsed().as_micros() as f64 * rate) as u128;
     let frame_count = *count * micros_per_second;
 
     // If this is positive, we should sleep the difference away
     let count_delta = (frame_count as i128) - (expected_frame_count as i128);
 
     if count_delta > 0 {
-        let sleep_time = (count_delta as u128) / rate;
+        let sleep_time = ((count_delta as f64) / rate) as u128;
         thread::sleep(Duration::from_micros(sleep_time as u64));
     }
 }
