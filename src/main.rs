@@ -19,6 +19,8 @@ use clap::{App, Arg};
 use path_absolutize::*;
 use thiserror::Error;
 
+type Line = (usize, String);
+
 #[derive(Debug, Error)]
 enum FileError {
     #[error("Unable to access file: \"{path}\"")]
@@ -26,9 +28,9 @@ enum FileError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("Unable to read line: {error_line}")]
+    #[error("Unable to read line: {error_line}.")]
     ReadError {
-        valid_reads: Vec<String>,
+        valid_reads: Vec<Line>,
         error_line: usize,
         source: std::io::Error,
     },
@@ -40,7 +42,7 @@ fn main() -> Result<()> {
     let matches = App::new("tail")
         .version("1.0")
         .author("Andy")
-        .about("Monitors a file, continuously printing new lines written to it")
+        .about("Monitors a file, continuously printing new lines written to it.")
         .arg(
             Arg::with_name("n")
                 .short("n")
@@ -74,7 +76,7 @@ fn main() -> Result<()> {
                 .takes_value(true)
                 .value_name("FILE")
                 .required(true)
-                .help("The file to monitor"),
+                .help("The file to monitor."),
         )
         .arg(
             Arg::with_name("rate")
@@ -98,35 +100,33 @@ fn main() -> Result<()> {
         )
         .arg(
             Arg::with_name("head")
+                .long("head")
                 .case_insensitive(true)
                 .takes_value(false)
-                .help("Read from the beginning of the file"),
+                .required(false)
+                .help("Read from the beginning of the file."),
         )
         .arg(
             Arg::with_name("reverse")
                 .short("r")
                 .case_insensitive(true)
-                .long("-reverse")
+                .long("reverse")
                 .case_insensitive(true)
                 .takes_value(false)
                 .required(false)
-                .help("Read in reverse direction"),
+                .help("Print lines in reverse direction."),
         )
         .get_matches();
 
     let mut clock = Instant::now();
 
-    let reading_direction = if matches.is_present("reverse") {
-        ReadingDirection::BottomToTop
+    let (start_position, reading_direction) = if matches.is_present("head") {
+        (Position::Begin, ReadingDirection::TopToBottom)
     } else {
-        ReadingDirection::TopToBottom
+        (Position::End, ReadingDirection::BottomToTop)
     };
 
-    let start_position = if matches.is_present("head") {
-        Position::End
-    } else {
-        Position::Begin
-    };
+    let reverse_flag = matches.is_present("reverse");
 
     let n = matches.value_of("n").unwrap().parse::<usize>().unwrap(); // Unwraps are safe because argument has validator and default value
 
@@ -134,7 +134,7 @@ fn main() -> Result<()> {
     let refresh_rate = matches.value_of("rate").unwrap().parse::<f64>().unwrap(); // Unwraps here are okay, I guess, because this has a default value and has a validator
 
     // Parse input argument as file path
-    let mut file_path = matches.value_of("file").unwrap(); // The unwrap here is safe, because the argument is required
+    let file_path = matches.value_of("file").unwrap(); // The unwrap here is safe, because the argument is required
     let mut file_patch = validate_path(file_path);
 
     // Try to handle possible errors
@@ -171,8 +171,24 @@ fn main() -> Result<()> {
 
     if matches.occurrences_of("n") > 0 {
         // Only read once. Do not monitor continuously
-        let lines = read_lines(file_path, reading_direction, start_position, n);
-        
+        let lines = read_lines(file_path, reading_direction, start_position, n)?;
+
+        if reverse_flag {
+            for (line_number, line) in lines.iter().rev() {
+                print!("{}:\t{}", line_number, line);
+                if !line.ends_with("\n") {
+                    println!();
+                }
+            }
+        } else {
+            for (line_number, line) in lines.iter() {
+                print!("{}:\t{}", line_number, line);
+                if !line.ends_with("\n") {
+                    println!();
+                }
+            }
+        }
+
     } else {
         // Monitor continuously
         clock = Instant::now();
@@ -196,11 +212,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
 enum ReadingDirection {
     TopToBottom,
     BottomToTop,
 }
 
+#[derive(Debug)]
 #[derive(PartialEq)]
 enum Position {
     Begin,
@@ -213,7 +231,7 @@ fn read_lines(
     direction: ReadingDirection,
     start_position: Position,
     n: usize,
-) -> std::result::Result<Vec<String>, FileError> {
+) -> std::result::Result<Vec<Line>, FileError> {
     let (start, stop) = match direction {
         ReadingDirection::TopToBottom => match start_position {
             Position::Begin => (Position::Begin, Position::Inbetween(n)),
@@ -236,7 +254,6 @@ fn read_lines(
     }
 
     let mut line_count = 0;
-    let mut lines_in_range = 0;
     let mut lines = VecDeque::new();
     let mut line_buffer = String::new();
     let file = OpenOptions::new()
@@ -286,15 +303,15 @@ fn read_lines(
             }
         }
 
-        lines.push_back(line_buffer.clone());
+        lines.push_back((line_count, line_buffer.clone()));
         if lines.len() > n {
             lines.pop_front();
         }
     }
 
     match direction {
-        ReadingDirection::TopToBottom => Ok(lines.into_iter().collect()),
-        ReadingDirection::BottomToTop => Ok(lines.into_iter().rev().collect()),
+        ReadingDirection::TopToBottom => Ok(lines.into_iter().rev().collect()),
+        ReadingDirection::BottomToTop => Ok(lines.into_iter().collect()),
     }
 
     // https://crates.io/crates/easy_reader
