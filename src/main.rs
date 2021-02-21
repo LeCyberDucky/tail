@@ -288,7 +288,7 @@ fn read_lines(
                 return Err(FileError::ReadError {
                     valid_reads: match direction {
                         ReadingDirection::TopToBottom => lines.into(),
-                        ReadingDirection::BottomToTop => lines.into_iter().rev().collect(),
+                        ReadingDirection::BottomToTop => lines.into(),
                     },
                     error_line: line_count,
                     source: error,
@@ -309,10 +309,7 @@ fn read_lines(
         }
     }
 
-    match direction {
-        ReadingDirection::TopToBottom => Ok(lines.into_iter().rev().collect()),
-        ReadingDirection::BottomToTop => Ok(lines.into_iter().collect()),
-    }
+    Ok(lines.into_iter().collect())
 
     // https://crates.io/crates/easy_reader
     // https://www.reddit.com/r/rust/comments/99e4tq/reading_files_quickly_in_rust/
