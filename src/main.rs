@@ -6,16 +6,22 @@
 // 5. Other stuff from UNIX tail: https://en.wikipedia.org/wiki/Tail_(Unix)
 // 6. Take refresh rate as optional argument
 
-use std::collections::VecDeque;
-use std::io::BufReader;
-use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::{Duration, Instant};
-use std::{fs::OpenOptions, io::BufRead};
+use std::{
+    collections::VecDeque,
+    fs::OpenOptions,
+    io::BufRead,
+    io::BufReader,
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::anyhow;
 use anyhow::{Context, Result};
 use clap::{App, Arg};
+use crossbeam_utils::atomic::AtomicCell;
+use hotwatch::{Event, Hotwatch};
 use path_absolutize::*;
 use thiserror::Error;
 
@@ -28,7 +34,7 @@ enum FileError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("Unable to read line: {error_line}.")]
+    #[error("Unable to read line: {error_line}")]
     ReadError {
         valid_reads: Vec<Line>,
         error_line: usize,
@@ -42,7 +48,7 @@ fn main() -> Result<()> {
     let matches = App::new("tail")
         .version("1.0")
         .author("Andy")
-        .about("Monitors a file, continuously printing new lines written to it.")
+        .about("Monitors a file, continuously printing new lines written to it")
         .arg(
             Arg::with_name("n")
                 .short("n")
@@ -53,13 +59,13 @@ fn main() -> Result<()> {
                     let value = value.parse::<usize>();
                     match value {
                         Ok(_) => Ok(()),
-                        Err(_) => Err("n should be a positive integer.".to_string()),
+                        Err(_) => Err("n should be a positive integer".to_string()),
                     }
                 })
                 .value_name("NUMBER")
-                .conflicts_with("follow")
+                // .conflicts_with("follow")
                 .required(false)
-                .help("The number of lines to display."),
+                .help("The number of lines to display"),
         )
         .arg(
             Arg::with_name("follow")
@@ -69,14 +75,14 @@ fn main() -> Result<()> {
                 .case_insensitive(true)
                 .takes_value(false)
                 .required(false)
-                .help("Continuously monitor the file for new lines."),
+                .help("Continuously monitor the file for new lines"),
         )
         .arg(
             Arg::with_name("file")
                 .takes_value(true)
                 .value_name("FILE")
                 .required(true)
-                .help("The file to monitor."),
+                .help("The file to monitor"),
         )
         .arg(
             Arg::with_name("rate")
@@ -92,11 +98,11 @@ fn main() -> Result<()> {
                         }
                     }
 
-                    Err("rate should be a positive number.".to_string())
+                    Err("rate should be a positive number".to_string())
                 })
                 .value_name("NUMBER")
                 .required(false)
-                .help("Refresh rate in Hz -> How often to check for file updates."),
+                .help("Refresh rate in Hz -> How often to check for file updates"),
         )
         .arg(
             Arg::with_name("head")
@@ -104,7 +110,7 @@ fn main() -> Result<()> {
                 .case_insensitive(true)
                 .takes_value(false)
                 .required(false)
-                .help("Read from the beginning of the file."),
+                .help("Read from the beginning of the file"),
         )
         .arg(
             Arg::with_name("reverse")
@@ -114,11 +120,11 @@ fn main() -> Result<()> {
                 .case_insensitive(true)
                 .takes_value(false)
                 .required(false)
-                .help("Print lines in reverse direction."),
+                .help("Print lines in reverse direction"),
         )
         .get_matches();
 
-    let mut clock = Instant::now();
+    let clock = Instant::now();
 
     let (start_position, reading_direction) = if matches.is_present("head") {
         (Position::Begin, ReadingDirection::TopToBottom)
@@ -135,10 +141,10 @@ fn main() -> Result<()> {
 
     // Parse input argument as file path
     let file_path = matches.value_of("file").unwrap(); // The unwrap here is safe, because the argument is required
-    let mut file_patch = validate_path(file_path);
+    let mut file_path = validate_path(file_path);
 
     // Try to handle possible errors
-    file_patch = match file_patch {
+    file_path = match file_path {
         Ok(path) => Ok(path),
         Err(error) => {
             match error {
@@ -147,7 +153,7 @@ fn main() -> Result<()> {
                     source: _,
                 } => {
                     eprintln!("{}\n{:#?}", error, error);
-                    println!("Waiting for file to become accessible.");
+                    println!("Waiting for file to become accessible");
 
                     while !OpenOptions::new().read(true).open(path.clone()).is_ok() {
                         sleep_remaining_frame(clock, &mut refresh_count, refresh_rate);
@@ -167,7 +173,7 @@ fn main() -> Result<()> {
     };
 
     // If error can't be handled, return
-    let file_path = file_patch?;
+    let file_path = file_path?;
 
     if matches.occurrences_of("n") > 0 {
         // Only read once. Do not monitor continuously
@@ -188,11 +194,33 @@ fn main() -> Result<()> {
                 }
             }
         }
-
     } else {
         // Monitor continuously
-        clock = Instant::now();
+        let file_changed = Arc::new(AtomicCell::new(true));
+
+        let mut file_watcher = Hotwatch::new().context(format!(
+            "Hotwatch failed to initialize. Unable to monitor {:?}!",
+            file_path
+        ))?;
+
+        {
+            let file_changed = Arc::clone(&file_changed);
+
+            file_watcher
+                .watch(&file_path, move |event| {
+                    if let Event::Write(path) = event {
+                        file_changed.store(true);
+                    }
+                })
+                .context(format!("Failed to watch {:?}!", file_path))?;
+        }
+
         loop {
+            // Check if file has changed
+            if file_changed.compare_exchange(true, false).is_ok() {
+                println!("File changed!");
+            }
+
             sleep_remaining_frame(clock, &mut refresh_count, refresh_rate);
         }
     }
@@ -218,8 +246,7 @@ enum ReadingDirection {
     BottomToTop,
 }
 
-#[derive(Debug)]
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum Position {
     Begin,
     Inbetween(usize),
@@ -342,11 +369,11 @@ fn validate_path(path_string: &str) -> std::result::Result<PathBuf, FileError> {
 
     let path = Path::new(&path)
         .absolutize()
-        .with_context(|| format!("Unable to turn \"{}\" into absolute path.", path))?;
+        .with_context(|| format!("Unable to turn \"{}\" into absolute path", path))?;
 
     if path.is_dir() {
         return Err(FileError::OtherError(anyhow!(
-            "The path \"{}\" points to a directory. It should point to a file.",
+            "The path \"{}\" points to a directory. It should point to a file",
             match path.to_str() {
                 Some(str) => str,
                 None => "",
