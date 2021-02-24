@@ -5,12 +5,20 @@
 // 4. Option to clear output
 // 5. Other stuff from UNIX tail: https://en.wikipedia.org/wiki/Tail_(Unix)
 // 6. Take refresh rate as optional argument
+// 7. Handle Ctrl+C gracefully? https://rust-cli.github.io/book/in-depth/signals.html
+
+// TODO:
+// 1. Fix reading from last line
+// 2. Implement PartialOrd for Position https://doc.rust-lang.org/std/cmp/trait.PartialOrd.html
+// 3. Investigate delay for noticing file changes
+// 4. Add unit test for read_lines()
+
+#![feature(destructuring_assignment)]
 
 use std::{
     collections::VecDeque,
     fs::OpenOptions,
-    io::BufRead,
-    io::BufReader,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     sync::Arc,
     thread,
@@ -55,6 +63,7 @@ fn main() -> Result<()> {
                 .case_insensitive(true)
                 .takes_value(true)
                 .default_value("10")
+                .default_value_if("follow", None, "1")
                 .validator(|value| {
                     let value = value.parse::<usize>();
                     match value {
@@ -89,7 +98,7 @@ fn main() -> Result<()> {
                 .long("rate")
                 .case_insensitive(true)
                 .takes_value(true)
-                .default_value("4")
+                .default_value("60")
                 .validator(|value| {
                     let value = value.parse::<f64>();
                     if let Ok(number) = value {
@@ -126,18 +135,26 @@ fn main() -> Result<()> {
 
     let clock = Instant::now();
 
-    let (start_position, reading_direction) = if matches.is_present("head") {
-        (Position::Begin, ReadingDirection::TopToBottom)
-    } else {
-        (Position::End, ReadingDirection::BottomToTop)
-    };
+    let mut refresh_count = 0;
+    let refresh_rate = matches.value_of("rate").unwrap().parse::<f64>().unwrap(); // Unwraps here are okay, I guess, because this has a default value and has a validator
 
     let reverse_flag = matches.is_present("reverse");
 
     let n = matches.value_of("n").unwrap().parse::<usize>().unwrap(); // Unwraps are safe because argument has validator and default value
 
-    let mut refresh_count = 0;
-    let refresh_rate = matches.value_of("rate").unwrap().parse::<f64>().unwrap(); // Unwraps here are okay, I guess, because this has a default value and has a validator
+    let (start_position, stop_position, reading_direction) = if matches.is_present("head") {
+        (
+            Position::FromBegin(0),
+            Position::FromBegin(n),
+            ReadingDirection::TopToBottom,
+        )
+    } else {
+        (
+            Position::FromEnd(0),
+            Position::FromEnd(n),
+            ReadingDirection::BottomToTop,
+        )
+    };
 
     // Parse input argument as file path
     let file_path = matches.value_of("file").unwrap(); // The unwrap here is safe, because the argument is required
@@ -175,9 +192,22 @@ fn main() -> Result<()> {
     // If error can't be handled, return
     let file_path = file_path?;
 
-    if matches.occurrences_of("n") > 0 {
+    if matches.occurrences_of("follow") == 0 {
         // Only read once. Do not monitor continuously
-        let lines = read_lines(file_path, reading_direction, start_position, n)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(file_path.clone())
+            .map_err(|error| FileError::AccessError {
+                path: file_path,
+                source: error,
+            })?;
+
+        // let lines = read_lines(file_path, reading_direction, start_position, n)?;
+        let mut lines = read_lines(&mut file, start_position, stop_position, reading_direction)?;
+
+        if reading_direction == ReadingDirection::BottomToTop {
+            lines = lines.into_iter().rev().collect();
+        }
 
         if reverse_flag {
             for (line_number, line) in lines.iter().rev() {
@@ -221,6 +251,7 @@ fn main() -> Result<()> {
                 println!("File changed!");
             }
 
+            // TODO: Change this to 60Hz, since we are not polling the file anymore
             sleep_remaining_frame(clock, &mut refresh_count, refresh_rate);
         }
     }
@@ -240,63 +271,82 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum ReadingDirection {
     TopToBottom,
     BottomToTop,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum Position {
-    Begin,
-    Inbetween(usize),
-    End,
+    FromBegin(usize),
+    FromEnd(usize),
 }
 
-fn read_lines(
-    file_path: PathBuf,
+fn read_lines<Readable: Read>(
+    // file_path: PathBuf,
+    data: Readable,
+    mut start: Position,
+    mut stop: Position,
     direction: ReadingDirection,
-    start_position: Position,
-    n: usize,
 ) -> std::result::Result<Vec<Line>, FileError> {
-    let (start, stop) = match direction {
-        ReadingDirection::TopToBottom => match start_position {
-            Position::Begin => (Position::Begin, Position::Inbetween(n)),
-            Position::Inbetween(pos) => (Position::Inbetween(pos), Position::Inbetween(pos + n)),
-            Position::End => (Position::End, Position::End),
+    match direction {
+        ReadingDirection::TopToBottom => match (start, stop) {
+            (Position::FromBegin(a), Position::FromBegin(b)) => {
+                if a >= b {
+                    return Ok(vec![]);
+                }
+            }
+            (Position::FromBegin(_), Position::FromEnd(_)) => {}
+            (Position::FromEnd(_), Position::FromBegin(_)) => {}
+            (Position::FromEnd(a), Position::FromEnd(b)) => {
+                if a <= b {
+                    return Ok(vec![]);
+                }
+            }
         },
-
-        ReadingDirection::BottomToTop => match start_position {
-            Position::Begin => (Position::Begin, Position::Begin),
-            Position::Inbetween(pos) => (
-                Position::Inbetween(pos.saturating_sub(n)),
-                Position::Inbetween(pos),
-            ),
-            Position::End => (Position::Begin, Position::End),
+        ReadingDirection::BottomToTop => match (start, stop) {
+            (Position::FromBegin(a), Position::FromBegin(b)) => {
+                if a <= b {
+                    return Ok(vec![]);
+                } else {
+                    (start, stop) = (stop, start);
+                }
+            }
+            (Position::FromBegin(_), Position::FromEnd(_)) => {
+                (start, stop) = (stop, start);
+            }
+            (Position::FromEnd(_), Position::FromBegin(_)) => {
+                (start, stop) = (stop, start);
+            }
+            (Position::FromEnd(a), Position::FromEnd(b)) => {
+                if a >= b {
+                    return Ok(vec![]);
+                } else {
+                    (start, stop) = (stop, start);
+                }
+            }
         },
-    };
-
-    if start == Position::End || stop == Position::Begin {
-        return Ok(vec![]);
     }
 
-    let mut line_count = 0;
+    let mut reader = BufReader::new(data);
+
     let mut lines = VecDeque::new();
+    let mut line_count = 0;
     let mut line_buffer = String::new();
-    let file = OpenOptions::new()
-        .read(true)
-        .open(file_path.clone())
-        .map_err(|error| FileError::AccessError {
-            path: file_path,
-            source: error,
-        })?;
-    let mut reader = BufReader::new(file);
 
     // Keep on reading
     loop {
+        // When to store line?
+        // -> If start is FromBegin(pos) and line_count >= pos
+        // -> If start is FromEnd (since we don't know the total line count before hand)
+        // When to stop?
+        // -> If stop is FromBegin(pos) and line_count >= pos
+        // -> If end of file has been reached
+
         // Check for stop condition
-        if let Position::Inbetween(pos) = &stop {
-            if line_count >= *pos {
+        if let &Position::FromBegin(pos) = &stop {
+            if line_count >= pos {
                 break;
             }
         }
@@ -308,14 +358,19 @@ fn read_lines(
         match bytes_read {
             Ok(count) => {
                 if count == 0 {
+                    // End of file reached
                     break;
                 }
-            } // Break if end of file reached
+            }
             Err(error) => {
                 return Err(FileError::ReadError {
                     valid_reads: match direction {
                         ReadingDirection::TopToBottom => lines.into(),
-                        ReadingDirection::BottomToTop => lines.into(),
+                        ReadingDirection::BottomToTop => lines
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<(usize, String)>>()
+                            .into(),
                     },
                     error_line: line_count,
                     source: error,
@@ -324,19 +379,48 @@ fn read_lines(
         }
 
         // Only store line if wanted starting position has been passed
-        if let Position::Inbetween(pos) = start {
+        if let Position::FromBegin(pos) = start {
             if line_count < pos {
                 continue;
             }
         }
 
         lines.push_back((line_count, line_buffer.clone()));
-        if lines.len() > n {
-            lines.pop_front();
+
+        // Drop lines making the container larger than the greatest pos given in a FromEnd(pos)
+        match (start, stop) {
+            (Position::FromBegin(a), Position::FromBegin(b)) => {
+                if lines.len() > b - a {
+                    lines.pop_front();
+                }
+            }
+            (Position::FromBegin(_), Position::FromEnd(_)) => {}
+            (Position::FromEnd(a), Position::FromBegin(_)) => {
+                if lines.len() > a {
+                    lines.pop_front();
+                }
+            }
+            (Position::FromEnd(a), Position::FromEnd(_)) => {
+                if lines.len() > a {
+                    lines.pop_front();
+                }
+            }
         }
     }
 
-    Ok(lines.into_iter().collect())
+    // Remove lines towards end of file that shouldn't be included
+    if let Position::FromEnd(n) = stop {
+        lines.drain(lines.len().saturating_sub(n)..);
+    }
+
+    match direction {
+        ReadingDirection::TopToBottom => Ok(lines.into()),
+        ReadingDirection::BottomToTop => Ok(lines
+            .into_iter()
+            .rev()
+            .collect::<Vec<(usize, String)>>()
+            .into()),
+    }
 
     // https://crates.io/crates/easy_reader
     // https://www.reddit.com/r/rust/comments/99e4tq/reading_files_quickly_in_rust/
@@ -404,5 +488,35 @@ fn sleep_remaining_frame(clock: Instant, count: &mut u128, rate: f64) {
     if count_delta > 0 {
         let sleep_time = ((count_delta as f64) / rate) as u128;
         thread::sleep(Duration::from_micros(sleep_time as u64));
+    }
+}
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_lines() -> Result<()> {
+        let file = r"In Hamburg lebten zwei Ameisen,
+        Die wollten nach Australien reisen.
+        Bei Altona auf der Chaussee
+        Da taten ihnen die Beine weh,
+        Und da verzichteten sie weise
+        Denn auf den letzten Teil der Reise.
+        
+        So will man oft und kann doch nicht
+        Und leistet dann recht gern Verzicht."
+            .to_string();
+
+        let mut data = file.clone();
+        let (a, b) = (0, 7);
+        let (start, stop) = (Position::FromBegin(a), Position::FromBegin(b));
+        let direction = ReadingDirection::TopToBottom;
+        let lines = read_lines(data.as_bytes(), start, stop, direction)?;
+        let expected: Vec<(usize, String)> = (a..b)
+            .map(|i| (i + 1, data.lines().nth(i).unwrap().to_string() + "\n"))
+            .collect();
+
+        assert_eq!(lines, expected);
+        Ok(())
     }
 }
