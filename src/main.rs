@@ -8,10 +8,8 @@
 // 7. Handle Ctrl+C gracefully? https://rust-cli.github.io/book/in-depth/signals.html
 
 // TODO:
-// 1. Fix reading from last line
-// 2. Implement PartialOrd for Position https://doc.rust-lang.org/std/cmp/trait.PartialOrd.html
-// 3. Investigate delay for noticing file changes
-// 4. Add unit test for read_lines()
+// 1. Figure something out to handle double fired events
+// Perhaps this is not too important? Just operate on duplicate events too, since there will just be nothing new to read. Let's hope content isn't deleted in the mean time, however.
 
 #![feature(destructuring_assignment)]
 
@@ -111,7 +109,21 @@ fn main() -> Result<()> {
                 })
                 .value_name("NUMBER")
                 .required(false)
-                .help("Refresh rate in Hz -> How often to check for file updates"),
+                .help("Program logic refresh rate in Hz -> How often to check for file updates"),
+        )
+        .arg(
+            Arg::with_name("delay")
+                .long("delay")
+                .case_insensitive(true)
+                .takes_value(true)
+                .default_value("5000")
+                .validator(|value| match value.parse::<u64>() {
+                    Ok(_) => Ok(()),
+                    Err(_) => Err("Delay should be a non-negative 64-bit integer.".to_string()),
+                })
+                .value_name("NUMBER")
+                .required(false)
+                .help("Program logic refresh rate in Hz -> How often to check for file updates"),
         )
         .arg(
             Arg::with_name("head")
@@ -136,13 +148,15 @@ fn main() -> Result<()> {
     let clock = Instant::now();
 
     let mut refresh_count = 0;
-    let refresh_rate = matches.value_of("rate").unwrap().parse::<f64>().unwrap(); // Unwraps here are okay, I guess, because this has a default value and has a validator
+    let refresh_rate = matches.value_of("rate").unwrap().parse::<f64>().unwrap(); // Unwraps here are okay, I guess, because this has a default value and a validator
+
+    let notification_delay = matches.value_of("delay").unwrap().parse::<u64>().unwrap(); // Unwraps here are okay, I guess, because this has a default value and a validator
 
     let reverse_flag = matches.is_present("reverse");
 
     let n = matches.value_of("n").unwrap().parse::<usize>().unwrap(); // Unwraps are safe because argument has validator and default value
 
-    let (start_position, stop_position, reading_direction) = if matches.is_present("head") {
+    let (mut start_position, mut stop_position, reading_direction) = if matches.is_present("head") {
         (
             Position::FromBegin(0),
             Position::FromBegin(n),
@@ -192,43 +206,27 @@ fn main() -> Result<()> {
     // If error can't be handled, return
     let file_path = file_path?;
 
-    if matches.occurrences_of("follow") == 0 {
-        // Only read once. Do not monitor continuously
-        let mut file = OpenOptions::new()
-            .read(true)
-            .open(file_path.clone())
-            .map_err(|error| FileError::AccessError {
-                path: file_path,
-                source: error,
-            })?;
+    // Read once, and then monitor if wanted
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(file_path.clone())
+        .map_err(|error| FileError::AccessError {
+            path: file_path.clone(),
+            source: error,
+        })?;
 
-        // let lines = read_lines(file_path, reading_direction, start_position, n)?;
-        let mut lines = read_lines(&mut file, start_position, stop_position, reading_direction)?;
+    let lines = read_lines(&mut file, start_position, stop_position, reading_direction)?;
+    let mut last_read_line = lines.last().map(|(number, _)| *number).unwrap_or(0);
+    print_lines(lines, reading_direction, reverse_flag);
 
-        if reading_direction == ReadingDirection::BottomToTop {
-            lines = lines.into_iter().rev().collect();
-        }
-
-        if reverse_flag {
-            for (line_number, line) in lines.iter().rev() {
-                print!("{}:\t{}", line_number, line);
-                if !line.ends_with("\n") {
-                    println!();
-                }
-            }
-        } else {
-            for (line_number, line) in lines.iter() {
-                print!("{}:\t{}", line_number, line);
-                if !line.ends_with("\n") {
-                    println!();
-                }
-            }
-        }
-    } else {
+    if matches.occurrences_of("follow") > 0 {
         // Monitor continuously
-        let file_changed = Arc::new(AtomicCell::new(true));
+        let file_changed = Arc::new(AtomicCell::new(false));
 
-        let mut file_watcher = Hotwatch::new().context(format!(
+        let mut file_watcher = Hotwatch::new_with_custom_delay(Duration::from_millis(
+            notification_delay,
+        ))
+        .context(format!(
             "Hotwatch failed to initialize. Unable to monitor {:?}!",
             file_path
         ))?;
@@ -236,37 +234,46 @@ fn main() -> Result<()> {
         {
             let file_changed = Arc::clone(&file_changed);
 
+            println!("Watching! (⌐■_■)");
             file_watcher
                 .watch(&file_path, move |event| {
-                    if let Event::Write(path) = event {
+                    if let Event::Write(_path) = event {
                         file_changed.store(true);
+                        println!("File changed!");
                     }
                 })
                 .context(format!("Failed to watch {:?}!", file_path))?;
         }
 
         loop {
-            // Check if file has changed
+            // Monitor file
             if file_changed.compare_exchange(true, false).is_ok() {
-                println!("File changed!");
+                match reading_direction {
+                    ReadingDirection::TopToBottom => {
+                        todo!();
+                    }
+                    ReadingDirection::BottomToTop => {
+                        (start_position, stop_position) =
+                            (Position::FromEnd(0), Position::FromBegin(last_read_line));
+                    }
+                }
+
+                let mut lines =
+                    read_lines(&mut file, start_position, stop_position, reading_direction)?;
+                for (line_number, _) in &mut lines {
+                    *line_number += last_read_line;
+                }
+                last_read_line = lines
+                    .last()
+                    .map(|(number, _)| *number - last_read_line)
+                    .unwrap_or(0);
+                print_lines(lines, reading_direction, reverse_flag);
             }
 
             // TODO: Change this to 60Hz, since we are not polling the file anymore
             sleep_remaining_frame(clock, &mut refresh_count, refresh_rate);
         }
     }
-
-    // If -f specified, continuously monitor file
-
-    // loop {
-    //     // Check for file change
-    //     // Print change
-    //     // Sleep
-    // }
-
-    // Keep reading/printing
-
-    // No need to check for command line input, since ctrl+Z will just naturally terminate the program
 
     Ok(())
 }
@@ -433,6 +440,32 @@ fn read_lines<Readable: Read>(
     // https://stackoverflow.com/questions/31986628/collect-items-from-an-iterator-at-a-specific-index
 }
 
+fn print_lines(
+    mut lines: Vec<(usize, String)>,
+    reading_direction: ReadingDirection,
+    reverse_flag: bool,
+) {
+    if reading_direction == ReadingDirection::BottomToTop {
+        lines = lines.into_iter().rev().collect();
+    }
+
+    if reverse_flag {
+        for (line_number, line) in lines.iter().rev() {
+            print!("{}:\t{}", line_number, line);
+            if !line.ends_with("\n") {
+                println!();
+            }
+        }
+    } else {
+        for (line_number, line) in lines.iter() {
+            print!("{}:\t{}", line_number, line);
+            if !line.ends_with("\n") {
+                println!();
+            }
+        }
+    }
+}
+
 fn validate_path(path_string: &str) -> std::result::Result<PathBuf, FileError> {
     let mut path = path_string.to_string();
     if path.trim().is_empty() {
@@ -492,8 +525,6 @@ fn sleep_remaining_frame(clock: Instant, count: &mut u128, rate: f64) {
 }
 
 mod tests {
-    use super::*;
-
     #[test]
     fn test_read_lines() -> Result<()> {
         let file = r"In Hamburg lebten zwei Ameisen,
