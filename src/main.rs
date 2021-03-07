@@ -36,18 +36,18 @@ type Line = (usize, String);
 #[derive(Debug, Error)]
 enum FileError {
     #[error("Unable to access file: \"{path}\"")]
-    AccessError {
+    Access {
         path: PathBuf,
         source: std::io::Error,
     },
     #[error("Unable to read line: {error_line}")]
-    ReadError {
+    Read {
         valid_reads: Vec<Line>,
         error_line: usize,
         source: std::io::Error,
     },
     #[error(transparent)]
-    OtherError(#[from] anyhow::Error),
+    Other(#[from] anyhow::Error),
 }
 
 fn main() -> Result<()> {
@@ -116,7 +116,7 @@ fn main() -> Result<()> {
                 .long("delay")
                 .case_insensitive(true)
                 .takes_value(true)
-                .default_value("5000")
+                .default_value("100")
                 .validator(|value| match value.parse::<u64>() {
                     Ok(_) => Ok(()),
                     Err(_) => Err("Delay should be a non-negative 64-bit integer.".to_string()),
@@ -179,26 +179,26 @@ fn main() -> Result<()> {
         Ok(path) => Ok(path),
         Err(error) => {
             match error {
-                FileError::AccessError {
+                FileError::Access {
                     ref path,
                     source: _,
                 } => {
                     eprintln!("{}\n{:#?}", error, error);
                     println!("Waiting for file to become accessible");
 
-                    while !OpenOptions::new().read(true).open(path.clone()).is_ok() {
+                    while OpenOptions::new().read(true).open(path.clone()).is_err() {
                         sleep_remaining_frame(clock, &mut refresh_count, refresh_rate);
                         todo!();
                     }
 
                     Ok(path.clone())
                 }
-                FileError::ReadError {
+                FileError::Read {
                     valid_reads: _,
                     error_line: _,
                     source: _,
                 } => Err(error), // Don't think this case should happen, as we are not trying to read here
-                FileError::OtherError(_) => Err(error),
+                FileError::Other(_) => Err(error),
             }
         }
     };
@@ -210,13 +210,18 @@ fn main() -> Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
         .open(file_path.clone())
-        .map_err(|error| FileError::AccessError {
+        .map_err(|error| FileError::Access {
             path: file_path.clone(),
             source: error,
         })?;
 
     let lines = read_lines(&mut file, start_position, stop_position, reading_direction)?;
-    let mut last_read_line = lines.last().map(|(number, _)| *number).unwrap_or(0);
+    let mut last_read_line = match reading_direction {
+        // ReadingDirection::TopToBottom => lines.last().map(|(number, _)| *number).unwrap_or(0),
+        // ReadingDirection::BottomToTop => lines.first().map(|(number, _)| *number).unwrap_or(0),
+        ReadingDirection::TopToBottom => lines.last().cloned(),
+        ReadingDirection::BottomToTop => lines.first().cloned(),
+    };
     print_lines(lines, reading_direction, reverse_flag);
 
     if matches.occurrences_of("follow") > 0 {
@@ -239,7 +244,6 @@ fn main() -> Result<()> {
                 .watch(&file_path, move |event| {
                     if let Event::Write(_path) = event {
                         file_changed.store(true);
-                        println!("File changed!");
                     }
                 })
                 .context(format!("Failed to watch {:?}!", file_path))?;
@@ -254,23 +258,66 @@ fn main() -> Result<()> {
                     }
                     ReadingDirection::BottomToTop => {
                         (start_position, stop_position) =
-                            (Position::FromEnd(0), Position::FromBegin(last_read_line));
+                            (Position::FromEnd(0), Position::FromBegin(0)); // stop_position is FromBegin(0), since the curser is where we left it
                     }
                 }
 
                 let mut lines =
                     read_lines(&mut file, start_position, stop_position, reading_direction)?;
-                for (line_number, _) in &mut lines {
-                    *line_number += last_read_line;
+
+                // TODO: Adding blank new lines is still funky
+
+                // TODO: The following doesn't work when writing a bunch of new lines one after one. Fix this
+                // The last read line will be extended by a line ending if a new line is added. This will be read as the first new line and should be removed.
+
+                if let Some((last_line_number, ref last_line_content)) = last_read_line {
+                    if !last_line_content.ends_with("\n") {
+                        // Previous last line did not include newline characters
+                        match reading_direction {
+                            ReadingDirection::TopToBottom => {
+                                if let Some((_, line)) = lines.first() {
+                                    if line == "\r\n" || line == "\n" {
+                                        lines.remove(0);
+
+                                        for (line_number, _) in &mut lines {
+                                            *line_number += last_line_number - 1;
+                                            // - 1 because the new line ending on the previous last line will be counted as an individual new line
+                                        }
+                                    }
+                                }
+                            }
+                            ReadingDirection::BottomToTop => {
+                                if let Some((_, line)) = lines.last() {
+                                    if line == "\r\n" || line == "\n" {
+                                        lines.remove(lines.len() - 1);
+
+                                        for (line_number, _) in &mut lines {
+                                            *line_number += last_line_number - 1;
+                                            // - 1 because the new line ending on the previous last line will be counted as an individual new line
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                last_read_line = lines
-                    .last()
-                    .map(|(number, _)| *number - last_read_line)
-                    .unwrap_or(0);
+
+                match reading_direction {
+                    ReadingDirection::TopToBottom => {
+                        if lines.last().is_some() {
+                            last_read_line = lines.last().cloned();
+                        }
+                    }
+                    ReadingDirection::BottomToTop => {
+                        if lines.first().is_some() {
+                            last_read_line = lines.first().cloned();
+                        }
+                    }
+                }
+
                 print_lines(lines, reading_direction, reverse_flag);
             }
 
-            // TODO: Change this to 60Hz, since we are not polling the file anymore
             sleep_remaining_frame(clock, &mut refresh_count, refresh_rate);
         }
     }
@@ -291,7 +338,6 @@ enum Position {
 }
 
 fn read_lines<Readable: Read>(
-    // file_path: PathBuf,
     data: Readable,
     mut start: Position,
     mut stop: Position,
@@ -352,7 +398,7 @@ fn read_lines<Readable: Read>(
         // -> If end of file has been reached
 
         // Check for stop condition
-        if let &Position::FromBegin(pos) = &stop {
+        if let Position::FromBegin(pos) = stop {
             if line_count >= pos {
                 break;
             }
@@ -370,14 +416,12 @@ fn read_lines<Readable: Read>(
                 }
             }
             Err(error) => {
-                return Err(FileError::ReadError {
+                return Err(FileError::Read {
                     valid_reads: match direction {
                         ReadingDirection::TopToBottom => lines.into(),
-                        ReadingDirection::BottomToTop => lines
-                            .into_iter()
-                            .rev()
-                            .collect::<Vec<(usize, String)>>()
-                            .into(),
+                        ReadingDirection::BottomToTop => {
+                            lines.into_iter().rev().collect::<Vec<(usize, String)>>()
+                        }
                     },
                     error_line: line_count,
                     source: error,
@@ -422,11 +466,9 @@ fn read_lines<Readable: Read>(
 
     match direction {
         ReadingDirection::TopToBottom => Ok(lines.into()),
-        ReadingDirection::BottomToTop => Ok(lines
-            .into_iter()
-            .rev()
-            .collect::<Vec<(usize, String)>>()
-            .into()),
+        ReadingDirection::BottomToTop => {
+            Ok(lines.into_iter().rev().collect::<Vec<(usize, String)>>())
+        }
     }
 
     // https://crates.io/crates/easy_reader
@@ -452,14 +494,14 @@ fn print_lines(
     if reverse_flag {
         for (line_number, line) in lines.iter().rev() {
             print!("{}:\t{}", line_number, line);
-            if !line.ends_with("\n") {
+            if !line.ends_with('\n') {
                 println!();
             }
         }
     } else {
         for (line_number, line) in lines.iter() {
             print!("{}:\t{}", line_number, line);
-            if !line.ends_with("\n") {
+            if !line.ends_with('\n') {
                 println!();
             }
         }
@@ -469,7 +511,7 @@ fn print_lines(
 fn validate_path(path_string: &str) -> std::result::Result<PathBuf, FileError> {
     let mut path = path_string.to_string();
     if path.trim().is_empty() {
-        return Err(FileError::OtherError(anyhow!("Supplied path is empty!")));
+        return Err(FileError::Other(anyhow!("Supplied path is empty!")));
     }
 
     // If the path is relative, trim it and add "./" to the beginning
@@ -489,19 +531,16 @@ fn validate_path(path_string: &str) -> std::result::Result<PathBuf, FileError> {
         .with_context(|| format!("Unable to turn \"{}\" into absolute path", path))?;
 
     if path.is_dir() {
-        return Err(FileError::OtherError(anyhow!(
+        return Err(FileError::Other(anyhow!(
             "The path \"{}\" points to a directory. It should point to a file",
-            match path.to_str() {
-                Some(str) => str,
-                None => "",
-            }
+            path.to_str().unwrap_or("")
         )));
     }
 
     let file = OpenOptions::new().read(true).open(path.clone());
     match file {
         Ok(_) => Ok(path.into()),
-        Err(error) => Err(FileError::AccessError {
+        Err(error) => Err(FileError::Access {
             path: path.into(),
             source: error,
         }),
@@ -525,6 +564,10 @@ fn sleep_remaining_frame(clock: Instant, count: &mut u128, rate: f64) {
 }
 
 mod tests {
+    use crate::read_lines;
+    use crate::Position;
+    use crate::ReadingDirection;
+    use anyhow::Result;
     #[test]
     fn test_read_lines() -> Result<()> {
         let file = r"In Hamburg lebten zwei Ameisen,
@@ -538,7 +581,7 @@ mod tests {
         Und leistet dann recht gern Verzicht."
             .to_string();
 
-        let mut data = file.clone();
+        let data = file.clone();
         let (a, b) = (0, 7);
         let (start, stop) = (Position::FromBegin(a), Position::FromBegin(b));
         let direction = ReadingDirection::TopToBottom;
