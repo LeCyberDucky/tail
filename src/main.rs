@@ -265,23 +265,27 @@ fn main() -> Result<()> {
                 let mut lines =
                     read_lines(&mut file, start_position, stop_position, reading_direction)?;
 
-                // TODO: Adding blank new lines is still funky
+                let mut previous_last_read_line = last_read_line.clone();
 
-                // TODO: The following doesn't work when writing a bunch of new lines one after one. Fix this
-                // The last read line will be extended by a line ending if a new line is added. This will be read as the first new line and should be removed.
-
-                if let Some((last_line_number, ref last_line_content)) = last_read_line {
+                if let Some((last_line_number, last_line_content)) = &mut last_read_line {
                     if !last_line_content.ends_with("\n") {
-                        // Previous last line did not include newline characters
+                        // Previous last line did not include newline characters. These are read as their own line now
                         match reading_direction {
                             ReadingDirection::TopToBottom => {
                                 if let Some((_, line)) = lines.first() {
                                     if line == "\r\n" || line == "\n" {
+                                        // Consider this part of the last read line
+                                        if let Some((number, mut string)) = previous_last_read_line
+                                        {
+                                            string.push_str(line);
+                                            previous_last_read_line = Some((number, string));
+                                        };
+
                                         lines.remove(0);
 
                                         for (line_number, _) in &mut lines {
-                                            *line_number += last_line_number - 1;
-                                            // - 1 because the new line ending on the previous last line will be counted as an individual new line
+                                            *line_number += *last_line_number - 1;
+                                            // - 1 because the new line ending on the previous last line shoult not be counted as an individual new line
                                         }
                                     }
                                 }
@@ -289,15 +293,26 @@ fn main() -> Result<()> {
                             ReadingDirection::BottomToTop => {
                                 if let Some((_, line)) = lines.last() {
                                     if line == "\r\n" || line == "\n" {
+                                        // Consider this part of the last read line
+                                        if let Some((number, mut string)) = previous_last_read_line
+                                        {
+                                            string.push_str(line);
+                                            previous_last_read_line = Some((number, string));
+                                        };
+
                                         lines.remove(lines.len() - 1);
 
                                         for (line_number, _) in &mut lines {
-                                            *line_number += last_line_number - 1;
-                                            // - 1 because the new line ending on the previous last line will be counted as an individual new line
+                                            *line_number += *last_line_number - 1;
+                                            // - 1 because the new line ending on the previous last line should not be counted as an individual new line
                                         }
                                     }
                                 }
                             }
+                        }
+                    } else {
+                        for (line_number, _) in &mut lines {
+                            *line_number += *last_line_number;
                         }
                     }
                 }
@@ -306,14 +321,18 @@ fn main() -> Result<()> {
                     ReadingDirection::TopToBottom => {
                         if lines.last().is_some() {
                             last_read_line = lines.last().cloned();
+                        } else {
+                            last_read_line = previous_last_read_line;
                         }
                     }
                     ReadingDirection::BottomToTop => {
                         if lines.first().is_some() {
                             last_read_line = lines.first().cloned();
+                        } else {
+                            last_read_line = previous_last_read_line;
                         }
                     }
-                }
+                };
 
                 print_lines(lines, reading_direction, reverse_flag);
             }
@@ -564,10 +583,8 @@ fn sleep_remaining_frame(clock: Instant, count: &mut u128, rate: f64) {
 }
 
 mod tests {
-    use crate::read_lines;
-    use crate::Position;
-    use crate::ReadingDirection;
-    use anyhow::Result;
+    use super::*;
+
     #[test]
     fn test_read_lines() -> Result<()> {
         let file = r"In Hamburg lebten zwei Ameisen,
