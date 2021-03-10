@@ -268,7 +268,7 @@ fn main() -> Result<()> {
                 let mut previous_last_read_line = last_read_line.clone();
 
                 if let Some((last_line_number, last_line_content)) = &mut last_read_line {
-                    if !last_line_content.ends_with("\n") {
+                    if !last_line_content.ends_with('\n') {
                         // Previous last line did not include newline characters. These are read as their own line now
                         match reading_direction {
                             ReadingDirection::TopToBottom => {
