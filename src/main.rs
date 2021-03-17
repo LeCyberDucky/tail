@@ -1,15 +1,10 @@
 // Feature ideas
 // 1. Option for time stamps
 // 2. Option for monitoring multiple files simultaneously
-// 3. Option to read from top instead of bottom
-// 4. Option to clear output
-// 5. Other stuff from UNIX tail: https://en.wikipedia.org/wiki/Tail_(Unix)
-// 6. Take refresh rate as optional argument
-// 7. Handle Ctrl+C gracefully? https://rust-cli.github.io/book/in-depth/signals.html
+// 3. Option to clear output
+// 4. Other stuff from UNIX tail: https://en.wikipedia.org/wiki/Tail_(Unix)
+// 5. Handle Ctrl+C gracefully? https://rust-cli.github.io/book/in-depth/signals.html
 
-// TODO:
-// 1. Figure something out to handle double fired events
-// Perhaps this is not too important? Just operate on duplicate events too, since there will just be nothing new to read. Let's hope content isn't deleted in the mean time, however.
 
 #![feature(destructuring_assignment)]
 
@@ -188,7 +183,6 @@ fn main() -> Result<()> {
 
                     while OpenOptions::new().read(true).open(path.clone()).is_err() {
                         sleep_remaining_frame(clock, &mut refresh_count, refresh_rate);
-                        todo!();
                     }
 
                     Ok(path.clone())
@@ -254,7 +248,8 @@ fn main() -> Result<()> {
             if file_changed.compare_exchange(true, false).is_ok() {
                 match reading_direction {
                     ReadingDirection::TopToBottom => {
-                        todo!();
+                        // (Position::FromBegin(0), Position::FromEnd(0));
+                        todo!(); // Should probably reset cursor position in this case and not have FromEnd(0) as the stopping position
                     }
                     ReadingDirection::BottomToTop => {
                         (start_position, stop_position) =
@@ -273,39 +268,33 @@ fn main() -> Result<()> {
                         match reading_direction {
                             ReadingDirection::TopToBottom => {
                                 if let Some((_, line)) = lines.first() {
-                                    if line == "\r\n" || line == "\n" {
-                                        // Consider this part of the last read line
-                                        if let Some((number, mut string)) = previous_last_read_line
-                                        {
-                                            string.push_str(line);
-                                            previous_last_read_line = Some((number, string));
-                                        };
+                                    // Consider this part of the last read line
+                                    if let Some((number, mut string)) = previous_last_read_line {
+                                        string.push_str(line);
+                                        previous_last_read_line = Some((number, string));
+                                    };
 
-                                        lines.remove(0);
+                                    lines.remove(0);
 
-                                        for (line_number, _) in &mut lines {
-                                            *line_number += *last_line_number - 1;
-                                            // - 1 because the new line ending on the previous last line shoult not be counted as an individual new line
-                                        }
+                                    for (line_number, _) in &mut lines {
+                                        *line_number += *last_line_number - 1;
+                                        // - 1 because the new line ending on the previous last line shoult not be counted as an individual new line
                                     }
                                 }
                             }
                             ReadingDirection::BottomToTop => {
                                 if let Some((_, line)) = lines.last() {
-                                    if line == "\r\n" || line == "\n" {
-                                        // Consider this part of the last read line
-                                        if let Some((number, mut string)) = previous_last_read_line
-                                        {
-                                            string.push_str(line);
-                                            previous_last_read_line = Some((number, string));
-                                        };
+                                    // Consider this part of the last read line
+                                    if let Some((number, mut string)) = previous_last_read_line {
+                                        string.push_str(line);
+                                        previous_last_read_line = Some((number, string));
+                                    };
 
-                                        lines.remove(lines.len() - 1);
+                                    lines.remove(lines.len() - 1);
 
-                                        for (line_number, _) in &mut lines {
-                                            *line_number += *last_line_number - 1;
-                                            // - 1 because the new line ending on the previous last line should not be counted as an individual new line
-                                        }
+                                    for (line_number, _) in &mut lines {
+                                        *line_number += *last_line_number - 1;
+                                        // - 1 because the new line ending on the previous last line should not be counted as an individual new line
                                     }
                                 }
                             }
