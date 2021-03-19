@@ -58,7 +58,7 @@ fn main() -> Result<()> {
     let matches = App::new("tail")
         .version("1.0")
         .author("Andy")
-        .about("Monitors a file, continuously printing new lines written to it")
+        .about("Prints the last lines of a file")
         .arg(
             Arg::with_name("n")
                 .short("n")
@@ -112,7 +112,7 @@ fn main() -> Result<()> {
                 })
                 .value_name("NUMBER")
                 .required(false)
-                .help("Program logic refresh rate in Hz -> How often to check for file updates"),
+                .help("Program logic refresh rate in Hz"),
         )
         .arg(
             Arg::with_name("delay")
@@ -126,7 +126,7 @@ fn main() -> Result<()> {
                 })
                 .value_name("NUMBER")
                 .required(false)
-                .help("Program logic refresh rate in Hz -> How often to check for file updates"),
+                .help("Delay in milliseconds between checks for file changes"),
         )
         .arg(
             Arg::with_name("head")
@@ -135,7 +135,7 @@ fn main() -> Result<()> {
                 .takes_value(false)
                 .required(false)
                 .conflicts_with("follow")
-                .help("Read from the beginning of the file"),
+                .help("Read the first lines of the file, instead of the last lines"),
         )
         .arg(
             Arg::with_name("reverse")
@@ -145,7 +145,7 @@ fn main() -> Result<()> {
                 .case_insensitive(true)
                 .takes_value(false)
                 .required(false)
-                .help("Print lines in reverse direction"),
+                .help("Print lines in reverse order"),
         )
         .get_matches();
 
@@ -307,7 +307,7 @@ fn main() -> Result<()> {
                             }
                         }
                     } else {
-                        for (line_number, _) in &mut lines {                            
+                        for (line_number, _) in &mut lines {
                             *line_number += *last_line_number;
                         }
                     }
