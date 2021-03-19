@@ -1,10 +1,19 @@
 // Feature ideas
 // 1. Option for time stamps
-// 2. Option for monitoring multiple files simultaneously
-// 3. Option to clear output
-// 4. Other stuff from UNIX tail: https://en.wikipedia.org/wiki/Tail_(Unix)
-// 5. Handle Ctrl+C gracefully? https://rust-cli.github.io/book/in-depth/signals.html
+// 2. Option to clear output
+// 3. Other stuff from UNIX tail: https://en.wikipedia.org/wiki/Tail_(Unix)
+// 4. Handle Ctrl+C gracefully? https://rust-cli.github.io/book/in-depth/signals.html
 
+// Resources for improving performance
+// https://crates.io/crates/easy_reader
+// https://www.reddit.com/r/rust/comments/99e4tq/reading_files_quickly_in_rust/
+// https://github.com/Freaky/rust-linereader
+// https://www.reddit.com/r/rust/comments/99lm5l/easyreader_an_easy_and_fast_way_to_read_huge/
+// https://codereview.stackexchange.com/questions/227204/fast-text-search-in-rust
+// https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_line
+// https://www.reddit.com/r/rust/comments/8833lh/performance_of_parsing_large_file_2gb/
+// https://depth-first.com/articles/2020/07/20/reading-sd-files-in-rust/
+// https://stackoverflow.com/questions/31986628/collect-items-from-an-iterator-at-a-specific-index
 
 #![feature(destructuring_assignment)]
 
@@ -65,7 +74,6 @@ fn main() -> Result<()> {
                     }
                 })
                 .value_name("NUMBER")
-                // .conflicts_with("follow")
                 .required(false)
                 .help("The number of lines to display"),
         )
@@ -126,6 +134,7 @@ fn main() -> Result<()> {
                 .case_insensitive(true)
                 .takes_value(false)
                 .required(false)
+                .conflicts_with("follow")
                 .help("Read from the beginning of the file"),
         )
         .arg(
@@ -140,6 +149,7 @@ fn main() -> Result<()> {
         )
         .get_matches();
 
+    // Parsing input arguments
     let clock = Instant::now();
 
     let mut refresh_count = 0;
@@ -147,7 +157,7 @@ fn main() -> Result<()> {
 
     let notification_delay = matches.value_of("delay").unwrap().parse::<u64>().unwrap(); // Unwraps here are okay, I guess, because this has a default value and a validator
 
-    let reverse_flag = matches.is_present("reverse");
+    let reverse_output = matches.is_present("reverse");
 
     let n = matches.value_of("n").unwrap().parse::<usize>().unwrap(); // Unwraps are safe because argument has validator and default value
 
@@ -211,12 +221,10 @@ fn main() -> Result<()> {
 
     let lines = read_lines(&mut file, start_position, stop_position, reading_direction)?;
     let mut last_read_line = match reading_direction {
-        // ReadingDirection::TopToBottom => lines.last().map(|(number, _)| *number).unwrap_or(0),
-        // ReadingDirection::BottomToTop => lines.first().map(|(number, _)| *number).unwrap_or(0),
         ReadingDirection::TopToBottom => lines.last().cloned(),
         ReadingDirection::BottomToTop => lines.first().cloned(),
     };
-    print_lines(lines, reading_direction, reverse_flag);
+    print_lines(lines, reading_direction, reverse_output);
 
     if matches.occurrences_of("follow") > 0 {
         // Monitor continuously
@@ -233,7 +241,6 @@ fn main() -> Result<()> {
         {
             let file_changed = Arc::clone(&file_changed);
 
-            println!("Watching! (⌐■_■)");
             file_watcher
                 .watch(&file_path, move |event| {
                     if let Event::Write(_path) = event {
@@ -248,8 +255,8 @@ fn main() -> Result<()> {
             if file_changed.compare_exchange(true, false).is_ok() {
                 match reading_direction {
                     ReadingDirection::TopToBottom => {
-                        // (Position::FromBegin(0), Position::FromEnd(0));
-                        todo!(); // Should probably reset cursor position in this case and not have FromEnd(0) as the stopping position
+                        // This case should not happen, as the input arguments leading to this case should conflict
+                        anyhow::bail!("Continuous monitoring can only be used to check for new lines inserted at the end of the file, not at the top.");
                     }
                     ReadingDirection::BottomToTop => {
                         (start_position, stop_position) =
@@ -300,7 +307,7 @@ fn main() -> Result<()> {
                             }
                         }
                     } else {
-                        for (line_number, _) in &mut lines {
+                        for (line_number, _) in &mut lines {                            
                             *line_number += *last_line_number;
                         }
                     }
@@ -323,7 +330,7 @@ fn main() -> Result<()> {
                     }
                 };
 
-                print_lines(lines, reading_direction, reverse_flag);
+                print_lines(lines, reading_direction, reverse_output);
             }
 
             sleep_remaining_frame(clock, &mut refresh_count, refresh_rate);
@@ -374,12 +381,8 @@ fn read_lines<Readable: Read>(
                     (start, stop) = (stop, start);
                 }
             }
-            (Position::FromBegin(_), Position::FromEnd(_)) => {
-                (start, stop) = (stop, start);
-            }
-            (Position::FromEnd(_), Position::FromBegin(_)) => {
-                (start, stop) = (stop, start);
-            }
+            (Position::FromBegin(_), Position::FromEnd(_)) => (start, stop) = (stop, start),
+            (Position::FromEnd(_), Position::FromBegin(_)) => (start, stop) = (stop, start),
             (Position::FromEnd(a), Position::FromEnd(b)) => {
                 if a >= b {
                     return Ok(vec![]);
@@ -428,7 +431,7 @@ fn read_lines<Readable: Read>(
                     valid_reads: match direction {
                         ReadingDirection::TopToBottom => lines.into(),
                         ReadingDirection::BottomToTop => {
-                            lines.into_iter().rev().collect::<Vec<(usize, String)>>()
+                            lines.into_iter().rev().collect::<Vec<Line>>()
                         }
                     },
                     error_line: line_count,
@@ -437,7 +440,7 @@ fn read_lines<Readable: Read>(
             }
         }
 
-        // Only store line if wanted starting position has been passed
+        // Don't store line if wanted starting position hasn't been reached
         if let Position::FromBegin(pos) = start {
             if line_count < pos {
                 continue;
@@ -446,7 +449,7 @@ fn read_lines<Readable: Read>(
 
         lines.push_back((line_count, line_buffer.clone()));
 
-        // Drop lines making the container larger than the greatest pos given in a FromEnd(pos)
+        // Drop lines making the container larger than wanted
         match (start, stop) {
             (Position::FromBegin(a), Position::FromBegin(b)) => {
                 if lines.len() > b - a {
@@ -474,32 +477,16 @@ fn read_lines<Readable: Read>(
 
     match direction {
         ReadingDirection::TopToBottom => Ok(lines.into()),
-        ReadingDirection::BottomToTop => {
-            Ok(lines.into_iter().rev().collect::<Vec<(usize, String)>>())
-        }
+        ReadingDirection::BottomToTop => Ok(lines.into_iter().rev().collect::<Vec<Line>>()),
     }
-
-    // https://crates.io/crates/easy_reader
-    // https://www.reddit.com/r/rust/comments/99e4tq/reading_files_quickly_in_rust/
-    // https://github.com/Freaky/rust-linereader
-    // https://www.reddit.com/r/rust/comments/99lm5l/easyreader_an_easy_and_fast_way_to_read_huge/
-    // https://codereview.stackexchange.com/questions/227204/fast-text-search-in-rust
-    // https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_line
-    // https://www.reddit.com/r/rust/comments/8833lh/performance_of_parsing_large_file_2gb/
-    // https://depth-first.com/articles/2020/07/20/reading-sd-files-in-rust/
-    // https://stackoverflow.com/questions/31986628/collect-items-from-an-iterator-at-a-specific-index
 }
 
-fn print_lines(
-    mut lines: Vec<(usize, String)>,
-    reading_direction: ReadingDirection,
-    reverse_flag: bool,
-) {
+fn print_lines(mut lines: Vec<Line>, reading_direction: ReadingDirection, reverse_output: bool) {
     if reading_direction == ReadingDirection::BottomToTop {
         lines = lines.into_iter().rev().collect();
     }
 
-    if reverse_flag {
+    if reverse_output {
         for (line_number, line) in lines.iter().rev() {
             print!("{}:\t{}", line_number, line);
             if !line.ends_with('\n') {
@@ -562,7 +549,6 @@ fn sleep_remaining_frame(clock: Instant, count: &mut u128, rate: f64) {
     let expected_frame_count = (clock.elapsed().as_micros() as f64 * rate) as u128;
     let frame_count = *count * micros_per_second;
 
-    // If this is positive, we should sleep the difference away
     let count_delta = (frame_count as i128) - (expected_frame_count as i128);
 
     if count_delta > 0 {
@@ -592,7 +578,7 @@ mod tests {
         let (start, stop) = (Position::FromBegin(a), Position::FromBegin(b));
         let direction = ReadingDirection::TopToBottom;
         let lines = read_lines(data.as_bytes(), start, stop, direction)?;
-        let expected: Vec<(usize, String)> = (a..b)
+        let expected: Vec<Line> = (a..b)
             .map(|i| (i + 1, data.lines().nth(i).unwrap().to_string() + "\n"))
             .collect();
 
